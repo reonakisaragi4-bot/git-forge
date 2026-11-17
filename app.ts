@@ -12,14 +12,15 @@ import { routeRest, splitPath, type RestRequest } from './rest.ts';
 import { createStore } from './store.ts';
 
 /** Read the request body whole. GET/HEAD requests have none. */
-async function readBody(req: IncomingMessage): Promise<Buffer> {
+function readBody(req: IncomingMessage): Promise<Buffer> {
   const method = req.method ?? 'GET';
-  if (method === 'GET' || method === 'HEAD') return Buffer.alloc(0);
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
-  }
-  return Buffer.concat(chunks);
+  if (method === 'GET' || method === 'HEAD') return Promise.resolve(Buffer.alloc(0));
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string)));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
 }
 
 /** Write one handler reply onto the socket. */
@@ -34,10 +35,17 @@ function sendReply(res: ServerResponse, reply: Reply, requestId: string): void {
     res.end();
     return;
   }
-  const body = Buffer.isBuffer(reply.body) ? reply.body : Buffer.from(reply.body);
-  headers['content-length'] = String(body.length);
+  if (Buffer.isBuffer(reply.body)) {
+    headers['content-length'] = String(reply.body.length);
+    res.writeHead(reply.status, headers);
+    res.end(reply.body);
+    return;
+  }
+  // A string body is written as-is: Buffer.byteLength sizes it without
+  // allocating and copying the whole body first (2,000 read replies a round).
+  headers['content-length'] = String(Buffer.byteLength(reply.body));
   res.writeHead(reply.status, headers);
-  res.end(body);
+  res.end(reply.body);
 }
 
 /** Build the server. It binds nothing until the caller listens on a port. */
@@ -54,15 +62,29 @@ export function createApp(): Server {
     const requestId = `req-${nextRequestId}`;
     nextRequestId += 1;
     try {
-      const url = new URL(req.url ?? '/', 'http://entry');
-      const segments = splitPath(url.pathname);
+      // The suite sends origin-form URLs (path + query). Splitting them by
+      // hand is cheaper than a full URL parse on every request (2,000 read
+      // calls a round); only a non-path URL falls back to the URL parser.
+      const rawUrl = req.url ?? '/';
+      let pathname: string;
+      let query: URLSearchParams;
+      if (rawUrl.startsWith('/')) {
+        const q = rawUrl.indexOf('?');
+        pathname = q < 0 ? rawUrl : rawUrl.slice(0, q);
+        query = new URLSearchParams(q < 0 ? '' : rawUrl.slice(q + 1));
+      } else {
+        const url = new URL(rawUrl, 'http://entry');
+        pathname = url.pathname;
+        query = url.searchParams;
+      }
+      const segments = splitPath(pathname);
       const method = req.method ?? 'GET';
       const headers = req.headers as Record<string, string | string[] | undefined>;
       const host = typeof req.headers.host === 'string' ? req.headers.host : 'localhost';
       const body = await readBody(req);
 
       // The env's boot check: 200 {"ok":true}.
-      if (method === 'GET' && (url.pathname === '/healthz' || url.pathname === '/healthz/')) {
+      if (method === 'GET' && (pathname === '/healthz' || pathname === '/healthz/')) {
         sendReply(res, jsonReply(200, { ok: true }), requestId);
         return;
       }
@@ -70,7 +92,7 @@ export function createApp(): Server {
       let reply: Reply | null = null;
       // Git smart HTTP: /{owner}/{repo}.git/...
       if (segments.length >= 2 && (segments[1] as string).endsWith('.git')) {
-        const gitRequest: GitRequest = { method, segments, query: url.searchParams, headers, body };
+        const gitRequest: GitRequest = { method, segments, query, headers, body };
         reply = routeGit({ store, expectedToken }, gitRequest);
       }
       // GraphQL v4.
@@ -95,7 +117,7 @@ export function createApp(): Server {
         const restRequest: RestRequest = {
           method,
           segments,
-          query: url.searchParams,
+          query,
           body: parsedBody,
           malformedBody,
           headers,
