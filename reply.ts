@@ -36,8 +36,10 @@ export function bearerToken(headers: Record<string, string | string[] | undefine
   const raw = headers.authorization;
   const value = Array.isArray(raw) ? raw[0] : raw;
   if (typeof value !== 'string') return null;
-  const match = /^Bearer\s+(.+)$/.exec(value.trim());
-  return match === null ? null : (match[1] as string);
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('Bearer ')) return null;
+  const token = trimmed.slice('Bearer '.length).trim();
+  return token === '' ? null : token;
 }
 
 /** Whether the request's bearer token is the expected one (any non-empty token when none is set). */
