@@ -156,6 +156,8 @@ export interface TreeEntry {
 /** Parse a tree object into its entries, in stored order. */
 export function parseTree(data: Uint8Array): TreeEntry[] {
   const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const cached = treeViewCache.get(buffer);
+  if (cached !== undefined) return cached;
   const entries: TreeEntry[] = [];
   let offset = 0;
   while (offset < buffer.length) {
@@ -169,6 +171,7 @@ export function parseTree(data: Uint8Array): TreeEntry[] {
     entries.push({ mode, name, oid });
     offset = nul + 21;
   }
+  treeViewCache.set(buffer, entries);
   return entries;
 }
 
@@ -198,9 +201,21 @@ export interface CommitView {
   message: string;
 }
 
+// Parsed commit/tree views are pure functions of immutable object bytes, and
+// the store hands out the same Buffer instance for an object every time, so
+// caching a view on its buffer is safe: the bytes never change under it.
+// This matters because the ancestry walks (isAncestor on every push,
+// collectReachable on every fetch) re-parse the same commits over and over —
+// a push workload's history grows to hundreds of commits, and re-parsing the
+// whole chain per push is quadratic work.
+const commitViewCache = new WeakMap<Buffer, CommitView>();
+const treeViewCache = new WeakMap<Buffer, TreeEntry[]>();
+
 /** Parse a commit object. */
 export function parseCommit(data: Uint8Array): CommitView {
   const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const cached = commitViewCache.get(buffer);
+  if (cached !== undefined) return cached;
   const blank = buffer.indexOf('\n\n');
   const headerEnd = blank < 0 ? buffer.length : blank;
   const headerText = buffer.subarray(0, headerEnd).toString('utf8');
@@ -215,7 +230,9 @@ export function parseCommit(data: Uint8Array): CommitView {
     else if (line.startsWith('author ')) author = line.slice(7);
     else if (line.startsWith('committer ')) committer = line.slice(10);
   }
-  return { tree, parents, author, committer, message };
+  const view = { tree, parents, author, committer, message };
+  commitViewCache.set(buffer, view);
+  return view;
 }
 
 /** Build a commit object from its fields. */
@@ -556,10 +573,27 @@ export function commitAncestors(start: string, lookup: ObjectLookup): string[] {
   return order;
 }
 
-/** Whether `ancestor` is reachable from `descendant` (or equal to it). */
+/** Whether `ancestor` is reachable from `descendant` (or equal to it). Walks
+ * from the descendant and stops the moment the ancestor is found: a push's
+ * fast-forward check only needs to know the old tip is the new tip's parent,
+ * not the whole history. (The old code walked the entire ancestry into a list
+ * and then searched it, so every push re-parsed every commit on the branch —
+ * quadratic work on a growing history.) */
 export function isAncestor(ancestor: string, descendant: string, lookup: ObjectLookup): boolean {
   if (ancestor === descendant) return true;
-  return commitAncestors(descendant, lookup).includes(ancestor);
+  const seen = new Set<string>();
+  const stack: string[] = [descendant];
+  while (stack.length > 0) {
+    const oid = stack.pop() as string;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    if (oid === ancestor) return true;
+    const object = lookup(oid);
+    if (object === undefined || object.type !== 'commit') continue;
+    const view = parseCommit(object.data);
+    for (let i = view.parents.length - 1; i >= 0; i -= 1) stack.push(view.parents[i] as string);
+  }
+  return false;
 }
 
 /** The nearest common ancestor of two commits (first found walking both histories). */
