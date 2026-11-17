@@ -30,6 +30,8 @@ export function splitPath(path: string): string[] {
     .split('/')
     .filter((segment) => segment !== '')
     .map((segment) => {
+      // Suite paths are plain ASCII; only decode when an escape is present.
+      if (!segment.includes('%')) return segment;
       try {
         return decodeURIComponent(segment);
       } catch {
